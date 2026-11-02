@@ -1,6 +1,6 @@
 /* ============================================================
    Dream Japan — JFT Mock Test (3-file SPA)
-   v4.0.0 — Firestore only; no pricing-plan upgrade or server deployment
+   v4.1.0 — faster button feedback, deduplicated reads, compact exam checkpoints
    ============================================================ */
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
 import {
@@ -79,6 +79,47 @@ const state = {
 let _backHandling = false;
 let _lastHandledHash = location.hash;
 
+/* Fast response: short-lived reads, immediate busy feedback, compact exam saves. */
+const fastReads=new Map(),fastJobs=new Map(),warmMedia=new Map();
+const EXAM_SNAPSHOT_KEY=EXAM_STATE_KEY+"_questions";
+let savedSnapshotFor="";
+function readScope(key){return `${state.user?.uid||"guest"}:${state.isAdmin?"admin":"student"}:${key}`;}
+function memoRead(key,loader,ttl=15000){
+ const scoped=readScope(key),entry=fastReads.get(scoped),now=Date.now();
+ if(entry && (entry.pending || now-entry.time<ttl))return entry.promise;
+ const next={pending:true,time:now,promise:null};
+ next.promise=Promise.resolve().then(loader).then(value=>{next.pending=false;next.time=Date.now();return value;},error=>{if(fastReads.get(scoped)===next)fastReads.delete(scoped);throw error;});
+ fastReads.set(scoped,next);return next.promise;
+}
+function clearFastReads(...keys){
+ if(!keys.length){fastReads.clear();return;}
+ for(const key of keys)fastReads.delete(readScope(key));
+}
+function onceJob(key,work){
+ const scoped=readScope(key);if(fastJobs.has(scoped))return fastJobs.get(scoped);
+ const job=Promise.resolve().then(work).finally(()=>{if(fastJobs.get(scoped)===job)fastJobs.delete(scoped);});
+ fastJobs.set(scoped,job);return job;
+}
+function debounce(fn,delay=100){let timer;return (...args)=>{clearTimeout(timer);timer=setTimeout(()=>fn(...args),delay);};}
+function bindFastButtons(root=document){
+ root.querySelectorAll("button").forEach(button=>{
+  const handler=button.onclick;
+  if(!handler || handler._djFast || ["playBtn","prevBtn","nextBtn"].includes(button.id))return;
+  const wrapped=function(event){
+   if(button._djPending)return;
+   const original=button.innerHTML,disabled=button.disabled;
+   let result;
+   try{result=handler.call(this,event);}catch(error){console.error(error);toast(error.message||"Unable to complete action","err");return;}
+   if(!result || typeof result.then!=="function")return result;
+   button._djPending=true;button.disabled=true;button.setAttribute("aria-busy","true");
+   if(button.isConnected)button.textContent=button.dataset.busyLabel||"Please wait…";
+   const restore=()=>{button._djPending=false;button.removeAttribute("aria-busy");if(button.isConnected){button.innerHTML=original;button.disabled=disabled;}};
+   return Promise.resolve(result).then(value=>{restore();return value;},error=>{restore();console.error(error);toast(error.message||"Request failed. Please retry.","err");});
+  };
+  wrapped._djFast=true;button.onclick=wrapped;
+ });
+}
+
 /* ============ UTILS ============ */
 const $ = id => document.getElementById(id);
 const esc = s => String(s == null ? "" : s).replace(/&/g,"&amp;").replace(/</g,"&lt;")
@@ -102,9 +143,10 @@ function modal(title, bodyHTML, buttons) {
       m.classList.remove("show");
       const b = btns[+btn.dataset.idx];
       if (b && b.keepOpen) m.classList.add("show");
-      if (b && b.onClick) b.onClick();
+      if (b && b.onClick) return b.onClick();
     };
   });
+  bindFastButtons(m);
 }
 function closeModal() { $("modal").classList.remove("show"); }
 
@@ -375,6 +417,7 @@ async function resetPassword(email) {
   catch (e) { toast("Failed: " + e.message, "err"); }
 }
 async function logout() {
+  clearFastReads();warmMedia.clear();
   if (state._userSub) { state._userSub(); state._userSub = null; }
   if(state._requestsSub){state._requestsSub();state._requestsSub=null;}
   if (state._lockTick) { clearInterval(state._lockTick); state._lockTick = null; }
@@ -462,21 +505,21 @@ function getCache() {
 }
 function setCache(rows) { /* Paid question banks remain in memory only. */ }
 function clearQCache() {
+  clearFastReads("questions");
   try { localStorage.removeItem(CACHE_KEY); } catch {}
   try { sessionStorage.removeItem("dj_q_cache_v4"); } catch {}
 }
 
 async function fetchQuestionsFromFirestore() {
-  if(!state.isAdmin) await checkFreeAccess();
+ if(!state.isAdmin)await checkFreeAccess();
+ return readQuestionRows();
+}
+async function readQuestionRows(){
+ return memoRead("questions",async()=>{
   const snapshot=await getDoc(doc(db,QUESTIONS_DOC));
-  const data=snapshot.exists()?snapshot.data():null;
-  if (!data) throw new Error("Questions not found");
-  let rows = null;
-  if (Array.isArray(data)) rows = data;
-  else if (Array.isArray(data.questions)) rows = data.questions;
-  else for (const k of Object.keys(data)) { if (Array.isArray(data[k])) { rows = data[k]; break; } }
-  if (!rows) throw new Error("Invalid question bank");
-  return rows.map(normalizeRow).filter(Boolean).map((r,i)=>({...r,id:r.id||`legacy_${i}`}));
+  if(!snapshot.exists())throw new Error("Questions not found");
+  return rowList(snapshot.data());
+ },30000);
 }
 async function loadQuestions() {
   const rows = await fetchQuestionsFromFirestore();
@@ -566,7 +609,7 @@ async function bumpStreak() {
   } catch {}
 }
 async function requestAccess() { navigate("premium"); }
-async function requestPremium(planId) { openPayment(planId); }
+async function requestPremium(planId) { return openPayment(planId); }
 async function toggleBookmark(setIdx, secKey, qi) {
   if (!state.user) return;
   const p = state.profile || {};
@@ -585,20 +628,27 @@ async function toggleBookmark(setIdx, secKey, qi) {
 
 /* ============ EXAM STATE PERSIST ============ */
 function saveExamState(ex) {
-  try {
-    sessionStorage.setItem(EXAM_STATE_KEY, JSON.stringify({
-      uid:state.user.uid, attemptId:ex.attemptId, snapshot:ex.set, setIdx: ex.setIdx, startedAt: ex.startedAt,
-      si: ex.si, qi: ex.qi, left: ex.left, maxReachable: ex.maxReachable,
-      answers: ex.sections.map(s => s.questions.map(q => q.sel === undefined ? null : q.sel)),
-      played: ex.sections.map(s => s.questions.map(q => q.played || 0)),
-      locked: ex.sections.map(s => s.questions.map(q => !!q.locked))
-    }));
-  } catch {}
+ if(!ex || !state.user)return;
+ try{
+  const owner=`${state.user.uid}:${ex.attemptId||ex.startedAt}`;
+  if(savedSnapshotFor!==owner){
+   sessionStorage.setItem(EXAM_SNAPSHOT_KEY,JSON.stringify({owner,set:ex.set}));savedSnapshotFor=owner;
+  }
+  sessionStorage.setItem(EXAM_STATE_KEY,JSON.stringify({uid:state.user.uid,attemptId:ex.attemptId,setIdx:ex.setIdx,startedAt:ex.startedAt,si:ex.si,qi:ex.qi,left:ex.left,maxReachable:ex.maxReachable,
+   answers:ex.sections.map(s=>s.questions.map(q=>q.sel??null)),
+   played:ex.sections.map(s=>s.questions.map(q=>q.played||0)),
+   locked:ex.sections.map(s=>s.questions.map(q=>!!q.locked))}));
+ }catch{}
 }
-function loadExamState() {
-  try { const raw = sessionStorage.getItem(EXAM_STATE_KEY); return raw ? JSON.parse(raw) : null; } catch { return null; }
+function loadExamState(){
+ try{
+  const raw=sessionStorage.getItem(EXAM_STATE_KEY);if(!raw)return null;
+  const saved=JSON.parse(raw);
+  if(!saved.snapshot){const snapshot=JSON.parse(sessionStorage.getItem(EXAM_SNAPSHOT_KEY)||"null");if(snapshot?.owner===`${saved.uid}:${saved.attemptId||saved.startedAt}`)saved.snapshot=snapshot.set;}
+  return saved;
+ }catch{return null;}
 }
-function clearExamState() { try { sessionStorage.removeItem(EXAM_STATE_KEY); } catch {} }
+function clearExamState() { savedSnapshotFor="";try {sessionStorage.removeItem(EXAM_STATE_KEY);sessionStorage.removeItem(EXAM_SNAPSHOT_KEY);}catch{} }
 function saveResult(res) { try { sessionStorage.setItem(RESULT_KEY, JSON.stringify(res)); } catch {} }
 function loadResult() {
   try { const r = sessionStorage.getItem(RESULT_KEY); return r ? JSON.parse(r) : null; } catch { return null; }
@@ -632,7 +682,7 @@ function render() {
   else html = renderHomeScreen();
 
   root.innerHTML = html;
-  postRender();bindMedia();updateInstallBanner();
+  postRender();bindMedia();updateInstallBanner();bindFastButtons(root);
 }
 
 function topbarHTML() {
@@ -1254,7 +1304,7 @@ function postRender() {
     agree.onchange = () => { startBtn.disabled = !agree.checked; };
     startBtn.onclick = () => {
       if (!agree.checked) return toast("Please agree to the rules", "err");
-      beginExam(+state.params.set);
+      return beginExam(+state.params.set);
     };
   }
   const reqAcc2 = $("reqAcc2");
@@ -1307,7 +1357,9 @@ function postRender() {
 
 /* ============ EXAM ENGINE ============ */
 async function beginExam(setIdx, force = false) {
-  if(!await authorizeContent()) return;
+ return onceJob("beginExam",async()=>{
+  if(!hasPremium())return navigate("premium");
+  toast("Preparing your exam…");
   const prepared=await safeAction("startAttempt",{setIdx:setIdx+1});
   if(!prepared) return;
   const set=buildSets(prepared.questions)[setIdx];
@@ -1341,6 +1393,7 @@ async function beginExam(setIdx, force = false) {
   startTimer();
   bumpStreak();
   navigate("exam");
+ });
 }
 
 async function resumeExamFromSaved(saved) {
@@ -1394,11 +1447,11 @@ function tick() {
   }
   const elapsedSec = (Date.now()-ex.startedAt)/1000;
   ex.left = Math.max(0, EXAM_MIN*60-elapsedSec);
-  saveExamState(ex);
   const el = $("timerDisplay");
   if (el) {
     const secs = Math.ceil(ex.left);
-    el.innerHTML = ` <span>${pad(Math.floor(secs / 60))}:${pad(secs % 60)}</span>`;
+    const label=el.querySelector("span")||el,text=`${pad(Math.floor(secs/60))}:${pad(secs%60)}`;
+    if(label.textContent!==text)label.textContent=text;
     el.classList.toggle("low", ex.left <= 600);
   }
   if (ex.left <= 0 && !state._timeupShown) {
@@ -1727,6 +1780,7 @@ function renderPracticeScreen() {
   };
   if ($("playBtn")) $("playBtn").onclick = () => playAudio(q);
   bindMedia();
+  bindFastButtons(root);
 }
 function practiceSelect(i) {
   const pr = state.practice;
@@ -1777,13 +1831,13 @@ function bindAdminTab() {
     if (rb) rb.onclick = refreshQuestions;
   }
   if (adminTab === "students") {
-    $("studentSearch").oninput = filterStudents;
+    $("studentSearch").oninput = debounce(filterStudents);
     $("studentFilter").onchange=filterStudents;
     loadStudents();
   }
   if (adminTab === "requests") loadRequests();
   if (adminTab === "questions") {
-    $("qSearch").oninput = filterQuestions;
+    $("qSearch").oninput = debounce(filterQuestions);
     $("qSet").onchange=$("qSection").onchange=filterQuestions;
     $("setPreview").onclick=()=>previewSet();
     $("deleteSelected").onclick=deleteSelected;
@@ -1793,7 +1847,7 @@ function bindAdminTab() {
     loadQs();
   }
   if (adminTab === "settings") {
-    $("saveConfig").onclick=async()=>{try{appConfig={...appConfig,esewaNumber:$("cfgEsewa").value.trim(),whatsappNumber:$("cfgWhatsapp").value.trim(),qrPath:$("cfgQR").value.trim(),installPromptEnabled:$("cfgInstall").checked};await setDoc(doc(db,"appConfig","main"),appConfig,{merge:true});toast("Settings saved","ok");}catch(e){toast(e.message,"err");}};
+    $("saveConfig").onclick=async()=>{try{appConfig={...appConfig,esewaNumber:$("cfgEsewa").value.trim(),whatsappNumber:$("cfgWhatsapp").value.trim(),qrPath:$("cfgQR").value.trim(),installPromptEnabled:$("cfgInstall").checked};await setDoc(doc(db,"appConfig","main"),appConfig,{merge:true});clearFastReads("config");toast("Settings saved","ok");}catch(e){toast(e.message,"err");}};
     $("addPlan").onclick=()=>editPlan();
     document.querySelectorAll("[data-edit-plan]").forEach(b=>b.onclick=()=>editPlan(b.dataset.editPlan));
     $("exportBtn").onclick = exportJSON;
@@ -1802,7 +1856,7 @@ function bindAdminTab() {
 }
 async function loadStats() {
   try {
-    const usersSnap = await getDocs(collection(db, "users"));
+    const [usersSnap,reqSnap,questions]=await Promise.all([memoRead("adminUsers",()=>getDocs(collection(db,"users"))),memoRead("pendingRequests",()=>getDocs(query(collection(db,"accessRequests"),where("status","==","pending")))),readQuestionRows()]);
     let total = 0, active = 0, blocked = 0, premiumActive = 0;
     usersSnap.forEach(d => {
       const u = d.data();
@@ -1810,20 +1864,19 @@ async function loadStats() {
       if (u.status === "blocked") blocked++; else active++;
       if (u.premium && u.premium.expiry && daysLeft(u.premium.expiry) > 0) premiumActive++;
     });
-    const reqSnap = await getDocs(query(collection(db, "accessRequests"), where("status", "==", "pending")));
     if ($("statTotal")) $("statTotal").textContent = total;
     if ($("statActive")) $("statActive").textContent = active;
     if ($("statBlocked")) $("statBlocked").textContent = blocked;
     if ($("statPremium")) $("statPremium").textContent = premiumActive;
     if ($("statPending")) $("statPending").textContent = reqSnap.size;
-    if ($("statQuestions")) $("statQuestions").textContent = (await fetchQuestionsFromFirestore()).length;
+    if ($("statQuestions")) $("statQuestions").textContent = questions.length;
   } catch(e) {toast("Stats: "+e.message,"err");}
 }
 async function loadStudents() {
   const list = $("studentsList");
   if (!list) return;
   try {
-    const snap = await getDocs(collection(db, "users"));
+    const snap = await memoRead("adminUsers",()=>getDocs(collection(db,"users")));
     const users = [];
     snap.forEach(d => {
       if (state.user && d.id === state.user.uid) return;
@@ -1860,11 +1913,12 @@ function renderStudentRows(users) {
   list.querySelectorAll("[data-uact]").forEach(b => {
     b.onclick = () => {
       if (["revoke","device","note"].includes(b.dataset.uact)) return studentAction(b.dataset.uact,b.dataset.uid);
-      if (b.dataset.uact === "grant-prem") grantPremium(b.dataset.uid);
-      else if (b.dataset.uact === "toggle-practice") togglePractice(b.dataset.uid, b.dataset.val === "true");
-      else if (b.dataset.uact === "toggle-block") toggleBlock(b.dataset.uid, b.dataset.status);
+      if (b.dataset.uact === "grant-prem") return grantPremium(b.dataset.uid);
+      else if (b.dataset.uact === "toggle-practice") return togglePractice(b.dataset.uid, b.dataset.val === "true");
+      else if (b.dataset.uact === "toggle-block") return toggleBlock(b.dataset.uid, b.dataset.status);
     };
   });
+  bindFastButtons(list);
 }
 function filterStudents() {
  const q=($("studentSearch")?.value||"").toLowerCase(), f=$("studentFilter")?.value||"all";
@@ -1877,7 +1931,7 @@ async function loadRequests() {
   const list = $("requestsList");
   if (!list) return;
   try {
-    const snap = await getDocs(query(collection(db, "accessRequests"), orderBy("createdAt", "desc")));
+    const snap = await memoRead("adminRequests",()=>getDocs(query(collection(db,"accessRequests"),orderBy("createdAt","desc"))));
     const reqs = [];
     snap.forEach(d => reqs.push({ id: d.id, ...d.data() }));
     if (!reqs.length) { list.innerHTML = `<p class="muted center" style="padding:24px">No requests yet.</p>`; return; }
@@ -1895,11 +1949,12 @@ async function loadRequests() {
       </div>`).join("");
     list.querySelectorAll("[data-ract]").forEach(b => {
       b.onclick = () => {
-        if (b.dataset.ract === "approve") approveRequest(b.dataset.rid, b.dataset.uid, b.dataset.type, b.dataset.plan);
-        else rejectRequest(b.dataset.rid);
+        if (b.dataset.ract === "approve") return approveRequest(b.dataset.rid, b.dataset.uid, b.dataset.type, b.dataset.plan);
+        else return rejectRequest(b.dataset.rid);
       };
     });
   } catch (e) { list.innerHTML = `<p class="muted" style="color:var(--red)">${esc(e.message)}</p>`; }
+  bindFastButtons(list);
 }
 async function loadQs() {
   const list = $("questionsList");
@@ -1944,6 +1999,7 @@ function renderQRows(rows) {
       else if (b.dataset.qact === "del") deleteQ(row);
     };
   });
+  bindFastButtons(list);
 }
 function openQEditor(rowOrNull) {
   const isEdit = !!rowOrNull;
@@ -2046,6 +2102,7 @@ async function grantPremium(uid) {
  {label:"Cancel",cls:"btn-ghost"},{label:"Activate",onClick:async()=>{const days=Number($("grantDays").value);if(!Number.isInteger(days)||days<1||days>3650)return toast("Enter 1 to 3650 whole days","err");if(await safeAction("adminMembership",{action:"grant",uid,planId:$("grantPlan").value,days,note:$("grantNote").value})) {toast("Premium activated","ok");loadStudents();}}}]);
 }
 async function togglePractice(uid, value) {
+  clearFastReads("adminUsers");
   try {
     await updateDoc(doc(db, "users", uid), { practiceAccess: value });
     toast(`Practice ${value ? "granted" : "revoked"} `, "ok");
@@ -2059,6 +2116,7 @@ async function toggleBlock(uid, currentStatus) {
      { label: "Confirm", cls: newStatus === "blocked" ? "btn-danger" : "btn-primary", onClick: async () => {
        try {
          await updateDoc(doc(db, "users", uid), { status: newStatus });
+         clearFastReads("adminUsers");
          toast(`User ${newStatus}`, "ok"); loadStudents();
        } catch (e) { toast("Failed: " + e.message, "err"); }
      }}]);
@@ -2070,6 +2128,7 @@ async function approveRequest(rid,uid,type,planId) {
 async function rejectRequest(rid) {
   try {
     await updateDoc(doc(db, "accessRequests", rid), { status: "rejected" });
+    clearFastReads("adminRequests","pendingRequests");
     toast("Rejected", "ok"); loadRequests();
   } catch (e) { toast("Failed: " + e.message, "err"); }
 }
@@ -2099,6 +2158,7 @@ function setupRealtimeProfile(user) {
     if (!snap.exists()) return;
     const fresh = { uid: user.uid, ...snap.data() };
     const prev = state.profile;
+    if(prev?.status!==fresh.status||membershipUntil(prev?.premium?.expiry)!==membershipUntil(fresh.premium?.expiry))clearFastReads("questions");
     state.profile = fresh;
     if(fresh.status==="blocked" || (!state.isAdmin && !(fresh.premium && daysLeft(fresh.premium.expiry)>0))){
       stopAudio();state.sets=[];state.practice=null;
@@ -2125,6 +2185,7 @@ function setupRealtimeProfile(user) {
 }
 
 async function loadDataInBackground() {
+ return onceJob("background",async()=>{
  await Promise.allSettled([
   (async()=>{state.plans=await loadPlans();})(),
   (async()=>{if(state.user) state.results=await loadResults(state.user.uid);})(),
@@ -2134,6 +2195,7 @@ async function loadDataInBackground() {
  ]);
  if(state.user && ["home","profile","sets","premium","bookmarks","leaderboard"].includes(state.screen)) render();
  updateInstallBanner();setupAdminNotifications();
+ });
 }
 
 onAuthStateChanged(auth, async (user) => {
@@ -2209,6 +2271,9 @@ onAuthStateChanged(auth, async (user) => {
   }
 });
 
+// Save one compact checkpoint when the page is hidden; elapsed time uses startedAt.
+window.addEventListener("pagehide",()=>{if(state.exam)saveExamState(state.exam);});
+document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="hidden"&&state.exam)saveExamState(state.exam);});
 /* Keyboard shortcuts for exam */
 window.addEventListener("keydown", (e) => {
   if (state.screen !== "exam") return;
@@ -2325,8 +2390,8 @@ async function firestoreAction(name,data={}){
   case 'startAttempt':{
    await checkFreeAccess();const set=Number(data.setIdx);
    if(!Number.isInteger(set)||set<1||set>6)throw new Error('Invalid set');
-   const bank=await getDoc(doc(db,QUESTIONS_DOC));if(!bank.exists())throw new Error('Question bank not found');
-   const questions=rowList(bank.data()).filter(r=>r.set===set&&SECTIONS.some(s=>s.key===r.section));
+   const bankRows=await readQuestionRows();
+   const questions=bankRows.filter(r=>r.set===set&&SECTIONS.some(s=>s.key===r.section));
    if(!questions.length)throw new Error('This set has no questions');
    return {attemptId:uuid(),questions};
   }
@@ -2335,7 +2400,7 @@ async function firestoreAction(name,data={}){
  }
 }
 async function safeAction(name,data={}){
- try{return await firestoreAction(name,data);}catch(error){
+ try{const result=await onceJob("action:"+name+":"+JSON.stringify(data),()=>firestoreAction(name,data));if(["requestPremium","adminMembership"].includes(name))clearFastReads("adminUsers","adminRequests","pendingRequests");return result;}catch(error){
   console.error('Dream Japan Firestore action failed',{action:name,code:error.code||'app/error',message:error.message});
   const code=String(error.code||'');
   const message=code.includes('permission-denied')?'Access denied. Publish the new no-upgrade Firestore rules, then sign out and sign in again.':code.includes('unavailable')?'Connection unavailable. Reconnect and try again.':error.message||'Unable to complete this action';
@@ -2365,11 +2430,11 @@ function bindMedia(){
  });
 }
 async function preloadMedia(questions){
- const urls=[...new Set(questions.flatMap(q=>[q.img,q.au&&!/^(tts:|scene:)/.test(q.au)?resolveUrl(q.au):null]).filter(Boolean))];
+ const urls=[...new Set(questions.flatMap(q=>[q.img,q.au&&!/^(tts:|scene:)/.test(q.au)?resolveUrl(q.au):null]).filter(Boolean))].filter(url=>Date.now()-(warmMedia.get(url)||0)>300000);
  if(!urls.length)return true;
  modal("Preparing your test",`<p>Loading images and audio before the timer begins.</p><progress id="preloadProgress" max="${urls.length}" value="0"></progress><p id="preloadText">0 / ${urls.length}</p>`,[]);
  let cursor=0,complete=0;const failed=[];
- await Promise.all(Array.from({length:Math.min(5,urls.length)},async()=>{while(cursor<urls.length){const url=urls[cursor++];const ctrl=new AbortController();const timer=setTimeout(()=>ctrl.abort(),25000);try{const r=await fetch(url,{signal:ctrl.signal,cache:"force-cache"});if(!r.ok)throw new Error("Media missing");await r.blob();}catch{failed.push(url);}finally{clearTimeout(timer);complete++;if($("preloadProgress"))$("preloadProgress").value=complete;if($("preloadText"))$("preloadText").textContent=`${complete} / ${urls.length}`;}}}));
+ await Promise.all(Array.from({length:Math.min(5,urls.length)},async()=>{while(cursor<urls.length){const url=urls[cursor++];const ctrl=new AbortController();const timer=setTimeout(()=>ctrl.abort(),25000);try{const r=await fetch(url,{signal:ctrl.signal,cache:"force-cache"});if(!r.ok)throw new Error("Media missing");await r.blob();warmMedia.set(url,Date.now());}catch{failed.push(url);}finally{clearTimeout(timer);complete++;if($("preloadProgress"))$("preloadProgress").value=complete;if($("preloadText"))$("preloadText").textContent=`${complete} / ${urls.length}`;}}}));
  closeModal();
  if(!failed.length)return true;
  return await new Promise(resolve=>modal("Some media could not load",`<p>${failed.length} media files failed. Retry before beginning if you need listening or image questions.</p>`,[{label:"Cancel",cls:"btn-ghost",onClick:()=>resolve(false)},{label:"Retry",onClick:async()=>resolve(await preloadMedia(questions))},{label:"Continue",cls:"btn-ghost",onClick:()=>resolve(true)}]));
@@ -2377,9 +2442,13 @@ async function preloadMedia(questions){
 async function copyText(value){try{await navigator.clipboard.writeText(value);toast("Copied","ok");}catch{modal("Copy this value",`<input class="input" readonly value="${esc(value)}" onclick="this.select()">`);}}
 async function openPayment(planId){
  const plan=state.plans.find(p=>p.id===planId);if(!plan)return;
- const pending=await getDocs(query(collection(db,"accessRequests"),where("uid","==",state.user.uid),where("status","==","pending")));
+ const token=state._paymentOpenToken=(state._paymentOpenToken||0)+1;
+ modal("Opening payment",`<p>Loading payment details…</p>`,[{label:"Cancel",cls:"btn-ghost"}]);
+ let pending,c;
+ try{[pending,c]=await Promise.all([getDocs(query(collection(db,"accessRequests"),where("uid","==",state.user.uid),where("status","==","pending"))),memoRead("config",()=>getDoc(doc(db,"appConfig","main")),30000)]);}catch(error){if(token===state._paymentOpenToken)closeModal();throw error;}
+ if(token!==state._paymentOpenToken||!$("modal").classList.contains("show"))return;
  if(!pending.empty)return modal("Request already pending","Your payment request is waiting for admin verification. Please do not submit again.");
- const c=await getDoc(doc(db,"appConfig","main"));if(c.exists())appConfig={...appConfig,...c.data()};
+ if(c.exists())appConfig={...appConfig,...c.data()};
  const email=state.user.email||"";
  modal("Pay with eSewa",`<p><b>${esc(plan.name)} · NPR ${Number(plan.price)}</b> · ${Number(plan.days)} days</p><img class="payment-qr" src="${esc(resolveUrl(appConfig.qrPath))}" alt="Admin eSewa payment QR"><p>eSewa number</p><button class="copy-value" id="copyEsewa">${esc(appConfig.esewaNumber||"Admin must configure the payment number")} · Copy</button><p class="mt-2">Payment remark: your email</p><button class="copy-value" id="copyEmail">${esc(email)} · Copy</button><label class="field mt-2">eSewa transaction reference<input id="paymentRef" class="input" maxlength="120" value="${esc(state._paymentDraft?.planId===planId?state._paymentDraft.reference:"")}" placeholder="Enter transaction ID" required></label><p class="muted small">Use this same browser after payment. Admin verification is required.</p>`,[{label:"Cancel",cls:"btn-ghost"},{label:"I have completed payment",keepOpen:true,onClick:async()=>{
  const ref=$("paymentRef").value.trim();state._paymentDraft={planId,reference:ref};if(!ref)return toast("Enter your eSewa transaction reference","err");
@@ -2408,7 +2477,7 @@ async function mutateQuestions(transform){
 async function moveQuestion(row,delta){try{await mutateQuestions(rows=>{const i=rows.findIndex(r=>r.id===row.id);const same=rows.map((r,i)=>({r,i})).filter(x=>x.r.set===row.set&&x.r.section===row.section);const at=same.findIndex(x=>x.i===i),target=same[at+delta]?.i;if(target!==undefined)[rows[i],rows[target]]=[rows[target],rows[i]];return rows;});filterQuestions();}catch(e){toast(e.message,"err");}}
 function deleteSelected(){const ids=[...document.querySelectorAll("[data-qcheck]:checked")].map(c=>c.dataset.qcheck);if(!ids.length)return toast("Select questions first","warn");modal("Delete selected questions?",`${ids.length} questions will be removed. Export a backup first if needed.`,[{label:"Cancel",cls:"btn-ghost"},{label:"Delete",cls:"btn-danger",onClick:async()=>{try{await mutateQuestions(rows=>rows.filter(r=>!ids.includes(r.id)));filterQuestions();}catch(e){toast(e.message,"err");}}}]);}
 async function studentAction(action,uid){
- if(action==="note"){const u=state._allStudents?.find(u=>u.uid===uid);modal("Student note",`<textarea class="input" id="studentNote">${esc(u?.note||"")}</textarea>`,[{label:"Cancel",cls:"btn-ghost"},{label:"Save",onClick:async()=>{try{await updateDoc(doc(db,"users",uid),{note:$("studentNote").value});loadStudents();}catch(e){toast(e.message,"err");}}}]);return;}
+ if(action==="note"){const u=state._allStudents?.find(u=>u.uid===uid);modal("Student note",`<textarea class="input" id="studentNote">${esc(u?.note||"")}</textarea>`,[{label:"Cancel",cls:"btn-ghost"},{label:"Save",onClick:async()=>{try{await updateDoc(doc(db,"users",uid),{note:$("studentNote").value});clearFastReads("adminUsers");loadStudents();}catch(e){toast(e.message,"err");}}}]);return;}
  modal(action==="device"?"Reset this student's device?":"Remove premium?",action==="device"?"The next browser to access premium will become the bound browser.":"Paid tests and practice will be disabled.",[{label:"Cancel",cls:"btn-ghost"},{label:"Confirm",onClick:async()=>{if(await safeAction("adminMembership",{uid,action:action==="device"?"resetDevice":"revoke"})){toast("Updated","ok");loadStudents();}}}]);
 }
 window.addEventListener("beforeinstallprompt",e=>{e.preventDefault();deferredInstall=e;updateInstallBanner();});
@@ -2425,7 +2494,7 @@ function setupAdminNotifications(){
  if(!state.isAdmin||state._requestsSub)return;
  let first=true;
  state._requestsSub=onSnapshot(query(collection(db,"accessRequests"),where("status","==","pending")),snap=>{
- const previous=state._pendingCount||0;state._pendingCount=snap.size;
+ const previous=state._pendingCount||0;state._pendingCount=snap.size;clearFastReads("adminRequests","pendingRequests");
  if(!first&&snap.size>previous)toast("New premium payment request received","ok");first=false;
  if($("pendingAdminCount"))$("pendingAdminCount").textContent=String(snap.size);
  if(state.screen==="admin"&&adminTab==="requests")loadRequests();
